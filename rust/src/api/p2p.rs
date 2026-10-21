@@ -1,9 +1,11 @@
 use easytier::common::config::{ConfigFileControl, PortForwardConfig};
 pub use easytier::common::config::{ConfigLoader, NetworkIdentity, PeerConfig, TomlConfigLoader};
 pub use easytier::common::global_ctx::{EventBusSubscriber, GlobalCtxEvent};
-pub use easytier::instance_manager::NetworkInstanceManager;
+use easytier::instance::factory::native_instance_manager;
+pub use easytier::instance::factory::NativeInstanceManager as NetworkInstanceManager;
 pub use easytier::proto;
 pub use easytier::proto::api::instance::{PeerRoutePair, Route};
+use easytier::proto::api::manage::NetworkInstanceRunningInfo;
 pub use easytier::proto::common::NatType;
 use lazy_static::lazy_static;
 use serde_json::json;
@@ -15,7 +17,7 @@ pub static DEFAULT_ET_DNS_ZONE: &str = "as.net.";
 
 lazy_static! {
     static ref RT: Runtime = Runtime::new().expect("failed to create tokio runtime");
-    static ref MANAGER: NetworkInstanceManager = NetworkInstanceManager::new();
+    static ref MANAGER: NetworkInstanceManager = native_instance_manager();
 }
 
 fn parse_instance_id(instance_id: &str) -> Result<Uuid, String> {
@@ -24,10 +26,10 @@ fn parse_instance_id(instance_id: &str) -> Result<Uuid, String> {
 
 async fn get_instance_info(
     instance_id: &str,
-) -> Result<easytier::launcher::NetworkInstanceRunningInfo, String> {
+) -> Result<NetworkInstanceRunningInfo, String> {
     let id = parse_instance_id(instance_id)?;
     MANAGER
-        .get_network_info(&id)
+        .network_info(id)
         .await
         .ok_or_else(|| "instance not found".to_string())
 }
@@ -206,7 +208,7 @@ pub async fn is_easytier_running(instance_id: String) -> bool {
     let Ok(id) = parse_instance_id(&instance_id) else {
         return false;
     };
-    MANAGER.list_network_instance_ids().contains(&id)
+    MANAGER.instance_ids().contains(&id)
 }
 
 pub use super::simple::{KVNetworkStatus, KVNodeConnectionStats, KVNodeInfo, NodeHopStats};
@@ -243,7 +245,7 @@ pub async fn get_ips(instance_id: String) -> Vec<String> {
 pub async fn set_tun_fd(instance_id: String, fd: i32) -> Result<(), String> {
     let id = parse_instance_id(&instance_id)?;
     MANAGER
-        .set_tun_fd(&id, fd)
+        .attach_tun_fd(id, fd)
         .map_err(|e| format!("set_tun_fd failed: {}", e))
 }
 
@@ -267,14 +269,17 @@ pub async fn get_running_info(instance_id: String) -> String {
 }
 
 pub use super::simple::{FlagsC, Forward};
+// `watch_event` is kept for API compatibility: the core instance now always
+// records its events into the running info.
 pub fn create_server(config_toml: String, watch_event: bool) -> JoinHandle<Result<String, String>> {
+    let _ = watch_event;
     RT.spawn(async move {
         let cfg = TomlConfigLoader::new_from_str(&config_toml)
             .map_err(|e| format!("invalid config toml: {}", e))?;
         let instance_id = cfg.get_id();
 
         MANAGER
-            .run_network_instance(cfg, watch_event, ConfigFileControl::STATIC_CONFIG)
+            .run_network_instance(cfg, ConfigFileControl::STATIC_CONFIG)
             .map_err(|e| format!("start instance failed: {}", e))?;
 
         Ok(instance_id.to_string())
@@ -408,7 +413,7 @@ pub fn create_server_with_flags(
         let instance_id = cfg.get_id();
 
         MANAGER
-            .run_network_instance(cfg, true, ConfigFileControl::STATIC_CONFIG)
+            .run_network_instance(cfg, ConfigFileControl::STATIC_CONFIG)
             .map_err(|e| format!("start instance failed: {}", e))?;
 
         Ok(instance_id.to_string())
@@ -417,8 +422,7 @@ pub fn create_server_with_flags(
 
 pub fn close_server(instance_id: String) -> Result<(), String> {
     let id = parse_instance_id(&instance_id)?;
-    MANAGER
-        .delete_network_instance(vec![id])
+    RT.block_on(MANAGER.delete_network_instances([id]))
         .map_err(|e| format!("delete instance failed: {}", e))?;
     Ok(())
 }

@@ -1,11 +1,10 @@
-use easytier::common::config::{ConfigFileControl, PortForwardConfig};
+use easytier::common::config::PortForwardConfig;
 pub use easytier::{
     common::{
         self,
         config::{ConfigLoader, NetworkIdentity, PeerConfig, TomlConfigLoader},
         global_ctx::{EventBusSubscriber, GlobalCtxEvent},
     },
-    launcher::NetworkInstance,
     proto,
     proto::{
         api::{
@@ -15,6 +14,10 @@ pub use easytier::{
         common::NatType,
     },
 };
+use easytier::instance::factory::{
+    native_instance_manager, subscribe_native_instance_event, NativeInstanceManager,
+};
+use easytier::proto::api::manage::NetworkInstanceRunningInfo;
 use lazy_static::lazy_static;
 use serde_json::json;
 pub use std::collections::BTreeMap;
@@ -26,7 +29,9 @@ pub use tokio::task::JoinHandle;
 pub static DEFAULT_ET_DNS_ZONE: &str = "as.net.";
 
 lazy_static! {
-    static ref INSTANCE: Arc<RwLock<Option<NetworkInstance>>> = Arc::new(RwLock::new(None));
+    static ref MANAGER: NativeInstanceManager = native_instance_manager();
+    // 当前网络实例的 ID，实例本身由 MANAGER 持有
+    static ref INSTANCE: Arc<RwLock<Option<uuid::Uuid>>> = Arc::new(RwLock::new(None));
 }
 // 创建一个 NetworkInstance 类型变量 储存当前服务器
 lazy_static! {
@@ -201,23 +206,44 @@ pub fn handle_event(mut events: EventBusSubscriber) -> tokio::task::JoinHandle<(
     })
 }
 
+async fn running_info(instance_id: &uuid::Uuid) -> Result<NetworkInstanceRunningInfo, String> {
+    MANAGER
+        .network_info(*instance_id)
+        .await
+        .ok_or_else(|| "instance not found".to_string())
+}
+
 async fn create_and_store_network_instance(cfg: TomlConfigLoader) -> Result<(), String> {
     println!("{:?}", cfg);
 
     // 在移动 cfg 之前先获取 ID
-    let name = cfg.get_id().to_string();
-    let had_instance = {
-        let mut instance_guard = INSTANCE.write().await;
-        instance_guard.take().is_some()
-    };
+    let instance_id = cfg.get_id();
+    let name = instance_id.to_string();
+    let previous = INSTANCE.write().await.take();
+    let had_instance = previous.is_some();
+    // 停止旧实例
+    if let Some(previous) = previous {
+        if let Err(e) = MANAGER.delete_network_instances([previous]).await {
+            println!("停止旧实例失败: {}", e);
+        }
+    }
     // 创建网络实例
-    let mut network = NetworkInstance::new(cfg, ConfigFileControl::STATIC_CONFIG);
+    let network = MANAGER
+        .create(cfg, ())
+        .map_err(|e| format!("create instance failed: {}", e))?;
+    // 先订阅事件再启动，避免漏掉启动阶段的事件
+    if let Some(events) = subscribe_native_instance_event(&network) {
+        handle_event(events);
+    }
     // 启动网络实例，并处理可能的错误
-    handle_event(network.start().unwrap());
+    if let Err(e) = network.start().await {
+        let _ = MANAGER.delete_network_instances([instance_id]).await;
+        return Err(format!("start instance failed: {:#}", e));
+    }
     println!("instance {} started", name);
-    // 将实例存储到 INSTANCE 中
+    // 将实例 ID 存储到 INSTANCE 中
     let mut instance_guard = INSTANCE.write().await;
-    *instance_guard = Some(network);
+    *instance_guard = Some(instance_id);
     if !had_instance {
         println!("实例已成功储存");
     } else {
@@ -290,7 +316,7 @@ pub async fn get_ips() -> Vec<String> {
     let instance = INSTANCE.read().await;
 
     if let Some(instance) = instance.as_ref() {
-        if let Ok(info) = instance.get_running_info().await {
+        if let Ok(info) = running_info(instance).await {
             // Add all remote node IPs
             for route in &info.routes {
                 if let Some(ipv4_addr) = &route.ipv4_addr {
@@ -319,14 +345,11 @@ pub async fn get_ips() -> Vec<String> {
 // 设置TUN设备的文件描述符
 pub async fn set_tun_fd(fd: i32) -> Result<(), String> {
     let instance = INSTANCE.read().await;
-    let instance = instance
+    let instance_id = instance
         .as_ref()
         .ok_or_else(|| "No instance available".to_string())?;
-    let sender = instance
-        .get_tun_fd_sender()
-        .ok_or_else(|| "tun fd sender not found".to_string())?;
-    sender
-        .try_send(Some(fd))
+    MANAGER
+        .attach_tun_fd(*instance_id, fd)
         .map_err(|e| format!("failed to send tun fd: {}", e))?;
     Ok(())
 }
@@ -335,7 +358,7 @@ pub async fn get_running_info() -> String {
     let instance = INSTANCE.read().await;
 
     if let Some(instance) = instance.as_ref() {
-        if let Ok(info) = instance.get_running_info().await {
+        if let Ok(info) = running_info(instance).await {
             return serde_json::to_string(&json!({
                 "dev_name": info.dev_name,
                 "my_node_info": info.my_node_info.as_ref().map(|node| json!({
@@ -556,11 +579,12 @@ pub fn close_server() {
         ); // 添加关闭前日志
 
         // 如果实例存在，则丢弃它
-        if let Some(instance) = locked_instance.take() {
+        if let Some(instance_id) = locked_instance.take() {
             println!("正在关闭实例");
-            // 丢弃实例
-            drop(instance);
-            println!("实例已成功关闭");
+            match MANAGER.delete_network_instances([instance_id]).await {
+                Ok(_) => println!("实例已成功关闭"),
+                Err(e) => println!("关闭实例失败: {}", e),
+            }
         } else {
             println!("没有找到需要关闭的实例");
         }
@@ -584,7 +608,7 @@ pub async fn get_peer_route_pairs() -> Result<Vec<PeerRoutePair>, String> {
 
     if let Some(instance) = instance_guard.as_ref() {
         // 获取运行信息
-        match instance.get_running_info().await {
+        match running_info(instance).await {
             Ok(info) => {
                 let mut pairs = info.peer_route_pairs;
                 // 如果存在本地节点信息，添加到结果中
@@ -650,7 +674,7 @@ pub async fn get_network_status() -> KVNetworkStatus {
     // 提前获取运行信息
     let instance_guard = INSTANCE.read().await;
     let running_info = if let Some(instance) = instance_guard.as_ref() {
-        instance.get_running_info().await.ok()
+        running_info(instance).await.ok()
     } else {
         None
     };

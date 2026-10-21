@@ -1,4 +1,4 @@
-use easytier::common::stun::{StunInfoCollector, UdpNatTypeDetector};
+use easytier::common::stun::{native_udp_nat_type_detector, StunInfoCollector};
 use easytier::proto::common::NatType as EasyNatType;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -95,7 +95,7 @@ async fn detect_nat_type_ipv4(stun_server: &str) -> Result<NatType, String> {
         return Err("No STUN servers available".to_string());
     }
 
-    let detector = UdpNatTypeDetector::new(stun_servers, 2);
+    let detector = native_udp_nat_type_detector(stun_servers, 2);
     let detect_result = tokio::time::timeout(Duration::from_secs(8), detector.detect_nat_type(0))
         .await
         .map_err(|_| "NAT detection timeout".to_string())
